@@ -612,10 +612,10 @@ class NetworkManager(object):
         self._network_dict = {}
         self._brian_list = []
         self._set_logger()
-        self._pre_built=False
-        self._pre_run=False
+        self._pre_built = False
+        self._pre_run = False
         self._network = None
-        self._force_single_core =force_single_core
+        self._force_single_core = force_single_core
 
 
 
@@ -627,7 +627,7 @@ class NetworkManager(object):
 
         """
         result = self.__dict__.copy()
-        del result['_logger'] #pickling does not work with loggers
+        del result['_logger']  # pickling does not work with loggers
         return result
 
     def __setstate__(self, statedict):
