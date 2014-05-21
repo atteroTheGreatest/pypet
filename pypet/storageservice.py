@@ -12,6 +12,9 @@ import logging
 import tables as pt
 import os
 import warnings
+import time
+import datetime
+import Queue
 
 import numpy as np
 from pandas import DataFrame, read_hdf, Series, Panel, Panel4D, HDFStore
@@ -76,12 +79,12 @@ class QueueStorageServiceSender(MultiprocWrapper, HasLogger):
              try:
                 self._logger.error('Failed sending task %s to queue, I will try again.' %
                                                 str(('STORE',args,kwargs)) )
-                self.queue.put(('STORE',args,kwargs))
+                self.queue.put(('STORE',args, kwargs))
                 self._logger.error('Second queue sending try was successful!')
              except IOError:
                 self._logger.error('Failed sending task %s to queue, I will try one last time.' %
                                                 str(('STORE',args,kwargs)) )
-                self.queue.put(('STORE',args,kwargs))
+                self.queue.put(('STORE',args, kwargs))
                 self._logger.error('Third queue sending try was successful!')
 
 
@@ -94,23 +97,60 @@ class QueueStorageServiceWriter(object):
     def __init__(self, storage_service, queue):
         self._storage_service = storage_service
         self._queue = queue
+        self._trajectory_name = None
 
     def run(self):
         """Starts listening to the queue."""
         while True:
             try:
-                msg,args,kwargs = self._queue.get()
+                to_store_list = []
+                stop_listening=False
+                while True:
+                    # We try to grap more data from the queue to avoid reopneing the
+                    # hdf5 file all the time
+                    try:
+                        msg,args,kwargs = self._queue.get(False)
+                        if msg == 'DONE':
+                            stop_listening=True
+                        elif msg == 'STORE':
+                            if 'msg' in kwargs:
+                                store_msg = kwargs.pop('msg')
+                            else:
+                                store_msg = args[0]
+                                args = args[1:]
+                            if 'stuff_to_store' in kwargs:
+                                stuff_to_store = kwargs.pop('stuff_to_store')
+                            else:
+                                stuff_to_store = args[0]
+                                args = args[1:]
+                            trajectory_name = kwargs.pop('trajectory_name')
+                            if self._trajectory_name is None:
+                                self._trajectory_name = trajectory_name
+                            elif self._trajectory_name != trajectory_name:
+                                raise RuntimeError('Cannot store into two different trajectories. '
+                                        'I am supposed to store into %s, but I should also '
+                                        'store into %s.' % (self._trajectory_name, trajectory_name))
 
-                if msg == 'DONE':
+                            to_store_list.append((store_msg, stuff_to_store, args, kwargs))
+                        else:
+                            raise RuntimeError('You queued something that was not intended to be queued!')
+
+                    except Queue.Empty:
+                        break
+
+                if to_store_list:
+                    self._storage_service.store(pypetconstants.LIST, to_store_list,
+                                                trajectory_name=self._trajectory_name)
+                if stop_listening:
                     break
-                elif msg == 'STORE':
-                    self._storage_service.store(*args, **kwargs)
-                else:
-                    raise RuntimeError('You queued something that was not intended to be queued!')
+
             except:
                 raise
             finally:
-                self._queue.task_done()
+                try:
+                    self._queue.task_done()
+                except ValueError:
+                    pass
 
 class LockWrapper(MultiprocWrapper, HasLogger):
     """For multiprocessing in :const:`~pypet.pypetconstants.WRAP_MODE_LOCK` mode,
@@ -183,6 +223,44 @@ class LazyStorageService(StorageService):
     def store(self,*args,**kwargs):
         """Do whatever you want, I won't store anything!"""
         pass
+
+
+class NodeProcessingTimer(HasLogger):
+    """Simple Class to display the processing of nodes"""
+    def __init__(self, display_time=30, logger_name=None):
+        self._start_time = time.time()
+        self._last_time = self._start_time
+        self._display_time = display_time
+        self._set_logger(logger_name)
+        self._updates=0
+        self._last_updates=0
+
+    def signal_update(self):
+        """Signals the process timer.
+
+        If more time than the display time has passed a message is emitted.
+
+        """
+        self._updates+=1
+        current_time = time.time()
+        dt = current_time - self._last_time
+        if dt > self._display_time:
+            dfullt = current_time-self._start_time
+            seconds = int(dfullt)%60
+            minutes = int(dfullt)/60
+            if minutes == 0:
+                formatted_time = '%ds' % seconds
+            else:
+                formatted_time = '%dm%02ds' %(minutes, seconds)
+            nodespersecond = self._updates/dfullt
+            message = 'Processed %d nodes in %s (%.2f nodes/s).' % \
+                      (self._updates, formatted_time, nodespersecond)
+            self._logger.info(message)
+            self._last_time=current_time
+
+
+
+
 
 class HDF5StorageService(StorageService, HasLogger):
     """Storage Service to handle the storage of a trajectory/parameters/results into hdf5 files.
@@ -387,7 +465,7 @@ class HDF5StorageService(StorageService, HasLogger):
     ''' Whether an hdf5 node is a leaf node'''
 
 
-    def __init__(self, filename=None, file_title='Experiment'):
+    def __init__(self, filename=None, file_title='Experiment', display_time=30):
         self._filename = filename
         self._file_title = file_title
         self._trajectory_name = None
@@ -403,7 +481,9 @@ class HDF5StorageService(StorageService, HasLogger):
         self._fletcher32 = False
         self._shuffle = True
 
+        self._node_processing_timer = None
 
+        self._display_time = display_time
 
         self._pandas_append = False
         self._pandas_format = 'fixed'
@@ -429,7 +509,14 @@ class HDF5StorageService(StorageService, HasLogger):
         # annoying as hell
         warnings.simplefilter('ignore', pt.NaturalNameWarning)
 
+    @property
+    def display_time(self):
+        """Time interval in seconds, when to display the storage or loading of nodes"""
+        return self._display_time
 
+    @display_time.setter
+    def display_time(self, display_time):
+        self._display_time = display_time
 
     @property
     def complib(self):
@@ -443,7 +530,7 @@ class HDF5StorageService(StorageService, HasLogger):
 
     @property
     def complevel(self):
-        "Compression level used"
+        """Compression level used"""
         return self._complevel
 
     @complevel.setter
@@ -514,7 +601,10 @@ class HDF5StorageService(StorageService, HasLogger):
         if self._filters is None:
             self._filters = pt.Filters(complib=self._complib, complevel=self._complevel,
                                        shuffle=self._shuffle, fletcher32=self._fletcher32)
-            self._srvc_close_pandas_store()
+            self._hdf5store._filters=self._filters
+            self._hdf5store._complevel = self._complevel
+            self._hdf5store._complib=self._complib
+            self._hdf5store._fletcher32 = self._fletcher32
 
         return self._filters
 
@@ -659,7 +749,7 @@ class HDF5StorageService(StorageService, HasLogger):
             self._logger.error('Failed loading  `%s`' % str(stuff_to_load))
             raise
 
-    def store(self,msg,stuff_to_store,*args,**kwargs):
+    def store(self, msg, stuff_to_store, *args, **kwargs):
         """ Stores a particular item to disk.
 
         The storage service always accepts these parameters:
@@ -989,7 +1079,7 @@ class HDF5StorageService(StorageService, HasLogger):
 
 
 
-    def _srvc_store_several_items(self,iterable,*args,**kwargs):
+    def _srvc_store_several_items(self, iterable, *args, **kwargs):
         """Stores several items from an iterable
 
         Iterables are supposed to be of a format like `[(msg, item, args, kwarg),...]`
@@ -1046,17 +1136,10 @@ class HDF5StorageService(StorageService, HasLogger):
                 if not os.path.exists(path):
                     os.makedirs(path)
 
-                # All following try-except blocks of this form are there to allow
-                # compatibility for PyTables 2.3.1 as well as 3.0+
-                try:
-                    # PyTables 3 API
-                    self._hdf5file = pt.open_file(filename=self._filename, mode=mode,
-                                             title=self._file_title)
-                except AttributeError:
-                    #PyTables 2 API
-                    self._hdf5file = pt.openFile(filename=self._filename, mode=mode,
-                                             title=self._file_title)
-
+                self._hdf5store = HDFStore(self._filename, self._mode, complib=self._complib,
+                                           complevel=self._complevel, fletcher32=self._fletcher32)
+                self._hdf5file = self._hdf5store._handle
+                self._hdf5file.title = self._file_title
 
                 if not ('/'+self._trajectory_name) in self._hdf5file:
                     # If we want to store individual items we we have to check if the
@@ -1090,13 +1173,9 @@ class HDF5StorageService(StorageService, HasLogger):
                 if not os.path.isfile(self._filename):
                     raise ValueError('File `' + self._filename + '` does not exist.')
 
-                try:
-                    self._hdf5file = pt.open_file(filename=self._filename, mode=mode,
-                                             title=self._file_title)
-                except AttributeError:
-                    self._hdf5file = pt.openFile(filename=self._filename, mode=mode,
-                                             title=self._file_title)
-
+                self._hdf5store = HDFStore(self._filename, self._mode, complib=self._complib,
+                                           complevel=self._complevel, fletcher32=self._fletcher32)
+                self._hdf5file = self._hdf5store._handle
 
 
                 if not self._trajectory_index is None:
@@ -1136,34 +1215,12 @@ class HDF5StorageService(StorageService, HasLogger):
             else:
                 raise RuntimeError('You shall not pass!')
 
+            self._node_processing_timer=NodeProcessingTimer(display_time=self._display_time,
+                        logger_name=self._logger.name)
+
             return True
         else:
             return False
-
-    def _srvc_open_pandas_store(self):
-        """Opens a pandas storage if this has not happened before"""
-        if self._hdf5store is None:
-            self._hdf5store = HDFStore(self._filename, mode=self._mode, complib=self._complib,
-                                   complevel=self._complevel, fletcher32= self._fletcher32)
-
-    def srvc_get_pandas_store(self):
-        """Returns the hdf5 store, opens one if None"""
-        if self._hdf5store is None:
-            self._srvc_open_pandas_store()
-        return self._hdf5store
-
-    def _srvc_close_pandas_store(self):
-        """Closes a pandas store if it exists"""
-        if self._hdf5store is not None:
-            if self._hdf5store is not None:
-                try:
-                    self._hdf5store.flush(fsync=True)
-                except TypeError:
-                    f_fd = self._hdf5store._handle.fileno()
-                    self._hdf5store.flush()
-                    os.fsync(f_fd)
-                self._hdf5store.close()
-                self._hdf5store = None
 
 
     def _srvc_closing_routine(self, closing):
@@ -1178,8 +1235,14 @@ class HDF5StorageService(StorageService, HasLogger):
             f_fd = self._hdf5file.fileno()
             self._hdf5file.flush()
             os.fsync(f_fd)
-            self._srvc_close_pandas_store()
-            self._hdf5file.close()
+            try:
+                self._hdf5store.flush(fsync=True)
+            except TypeError:
+                f_fd = self._hdf5store._handle.fileno()
+                self._hdf5store.flush()
+                os.fsync(f_fd)
+            self._hdf5store.close()
+            self._hdf5store = None
             self._hdf5file = None
             self._trajectory_group = None
             self._trajectory_name = None
@@ -2138,20 +2201,20 @@ class HDF5StorageService(StorageService, HasLogger):
                                                            tablename=table_name,
                                                            description=paramdescriptiondict)
 
-            # Index the summary tables for faster look up
-            # They are searched by the individual runs later on
-            if table_name.endswith('summary'):
-                try:
-                    paramtable.autoindex=True
-                except AttributeError:
-                    paramtable.autoIndex=True
-                if not paramtable.indexed:
-                    try:
-                        paramtable.cols.location.create_index()
-                        paramtable.cols.name.create_index()
-                    except AttributeError:
-                        paramtable.cols.location.createIndex()
-                        paramtable.cols.name.createIndex()
+            # # Index the summary tables for faster look up
+            # # They are searched by the individual runs later on
+            # if table_name.endswith('summary'):
+            #     try:
+            #         paramtable.autoindex=True
+            #     except AttributeError:
+            #         paramtable.autoIndex=True
+            #     if not paramtable.indexed:
+            #         try:
+            #             paramtable.cols.location.create_index(optlevel=8, kind='full')
+            #             paramtable.cols.name.create_index(optlevel=8, kind='full')
+            #         except AttributeError:
+            #             paramtable.cols.location.createIndex(optlevel=8, kind='full')
+            #             paramtable.cols.name.createIndex(optlevel=8, kind='full')
 
 
             paramtable.flush()
@@ -2435,6 +2498,8 @@ class HDF5StorageService(StorageService, HasLogger):
                 # Load data into the instance
                 self._prm_load_parameter_or_result(instance, _hdf5_group=hdf5group)
 
+            self._node_processing_timer.signal_update()
+
         else:
             # Else we are dealing with a group node
             if not name in parent_traj_node._children:
@@ -2463,6 +2528,8 @@ class HDF5StorageService(StorageService, HasLogger):
             # Load annotations if they are empty
             if new_traj_node.v_annotations.f_is_empty():
                 self._ann_load_annotations(new_traj_node, hdf5group)
+
+            self._node_processing_timer.signal_update()
 
             if recursive:
                 # We load recursively everything below it
@@ -2507,6 +2574,9 @@ class HDF5StorageService(StorageService, HasLogger):
             else:
                 self._logger.debug('Already found `%s` on disk I will not store it!' %
                                traj_node.v_full_name)
+
+            self._node_processing_timer.signal_update()
+
         else:
             # Else store it as a group node
 
@@ -2524,6 +2594,8 @@ class HDF5StorageService(StorageService, HasLogger):
                 self._logger.debug('Already found `%s` on disk I will not store it!' %
                                traj_node.v_full_name)
 
+            self._node_processing_timer.signal_update()
+
             if recursive:
                 # And if desired store recursively the subtree
                 for child in traj_node._children.itervalues():
@@ -2531,7 +2603,6 @@ class HDF5StorageService(StorageService, HasLogger):
 
 
     ######################## Storing a Single Run ##########################################
-
     def _srn_store_single_run(self, single_run, store_data, store_final):
         """ Stores a single run instance to disk (only meta data)"""
 
@@ -2812,14 +2883,21 @@ class HDF5StorageService(StorageService, HasLogger):
     @staticmethod
     def _all_attr_equals(ptitem, name,value):
         """Checks if a given hdf5 node attribute exists and if so if it matches the `value`."""
-        return name in ptitem._v_attrs and ptitem._v_attrs[name] == value
+        try:
+            return ptitem._v_attrs[name] == value
+        except KeyError:
+            return False
 
     @staticmethod
-    def _all_get_from_attrs(ptitem,name):
+    def _all_get_from_attrs(ptitem, name):
         """Gets an attribute `name` from `ptitem`, returns None if attribute does not exist."""
-        if name in ptitem._v_attrs:
+        # if name in ptitem._v_attrs:
+        #     return ptitem._v_attrs[name]
+        # else:
+        #     return None
+        try:
             return ptitem._v_attrs[name]
-        else:
+        except KeyError:
             return None
 
     def _all_set_attributes_to_recall_natives(self, data, ptitem_or_dict, prefix):
@@ -3829,7 +3907,7 @@ class HDF5StorageService(StorageService, HasLogger):
 
 
             name = group._v_pathname+'/' +key
-            pandas_store = self.srvc_get_pandas_store()
+            pandas_store = self._hdf5store
             pandas_store.put(name, data)
             pandas_store.flush()
             self._hdf5file.flush()
@@ -3876,7 +3954,7 @@ class HDF5StorageService(StorageService, HasLogger):
 
 
             name = group._v_pathname+'/' +key
-            pandas_store = self.srvc_get_pandas_store()
+            pandas_store = self._hdf5store
             pandas_store.put(name, data,
                              format=self.pandas_format,
                             append= self.pandas_append)
@@ -3924,7 +4002,7 @@ class HDF5StorageService(StorageService, HasLogger):
                 raise ValueError('DataFrame `%s` already exists in `%s`. Appending is not supported (yet).')
 
             name = group._v_pathname+'/' +key
-            pandas_store = self.srvc_get_pandas_store()
+            pandas_store = self._hdf5store
             pandas_store.put(name, data,
                              format=self.pandas_format,
                             append= self.pandas_append,
@@ -4478,7 +4556,7 @@ class HDF5StorageService(StorageService, HasLogger):
         try:
             name = pd_node._v_name
             pathname = pd_node._v_pathname
-            pandas_store = self.srvc_get_pandas_store()
+            pandas_store = self._hdf5store
             pandas_data = pandas_store.get(pathname)
             load_dict[name] = pandas_data
         except:
